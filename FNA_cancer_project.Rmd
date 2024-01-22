@@ -1,0 +1,506 @@
+---
+title: "M37DS Final Project - Predicting Malignancy/Benignness of Tumors"
+author: "Andrew Taranto"
+Date: May 5, 2023
+output: html_document
+df_print: paged
+---
+
+Preliminaries: clear environment, load libraries:
+
+```{r Set up environment}
+rm(list=ls())
+library(tidyverse)
+library(stats)
+library(dplyr)
+library(ggplot2)
+# For decision trees
+library(rpart)
+library(partykit)
+# For random forest
+library(randomForest)
+# For knn
+library(class)
+
+# Set the seed.
+set.seed(1842)
+```
+
+## EDA
+
+Our raw data consists of 33 columns, including mean, standard error ("se") and maximum ("worst") values for each of 10 continuous measurements. The "id" and "X" columns can be omitted, as the former just contains unique observation IDs, the latter contains only "NA" values. The binary categorial variable "diagnosis" is the variable to predict.
+
+```{r Load and glimpse dataset}
+# Load dataest
+fna_cancer <- read.csv("FNA_cancer.csv")
+
+# Remove "X" column, all 'NA'
+fna_cancer <- select(fna_cancer, select = -c("id", "X"))
+
+glimpse(fna_cancer)
+```
+
+Normalize the dataset to ensure best results with any model.
+
+```{r}
+# Create a scaled data set for testing and training
+rescale_x <- function(x){(x-min(x))/(max(x)-min(x))}
+
+fna_scaled <- data.frame(diagnosis = fna_cancer[, 1])
+
+# Apply rescale_x() to each column in fna_cancer (except the first column) and add them to fna_scaled
+fna_scaled <- cbind(fna_scaled, 
+                    data.frame(lapply(fna_cancer[, -1], rescale_x)))
+
+glimpse(fna_scaled)
+```
+
+First, we note that Just under 2/3rds of diagnoses are benign, just over 1/3rd are malignant.
+
+```{r}
+diag_counts <- table(fna_cancer$diagnosis)
+n_total <- sum(diag_counts)
+
+# Calculate percentages
+diag_pct <- round(diag_counts / n_total * 100, 2)
+
+# Define the colors to use
+pie_colors <- rainbow(length(diag_counts))
+
+# Create a pie chart with labels and colors
+pie(diag_counts, labels = paste(diag_pct, "%"), main = paste("Diagnosis (n =", n_total, ")"), col = pie_colors)
+
+# Replace the levels of the "diagnosis" variable
+levels(fna_cancer$diagnosis) <- c("Benign", "Malignant")
+
+# Add a legend with updated labels
+legend("right", legend = levels(fna_cancer$diagnosis), fill = pie_colors)
+```
+
+Next, we'll take a bird's-eye view of the data, looking at boxplots of each variable by diagnosis, with subgroups corresponding to the variable subgroups.
+
+```{r Column headers grouped by type of measurement}
+# create column headers for each group of measurements:
+
+column_headers <- names(fna_cancer)
+columns_mean <- column_headers[grep("_mean$", column_headers)]
+columns_se <- column_headers[grep("_se$", column_headers)]
+columns_max <- column_headers[grep("_worst$", column_headers)]
+columns_all <- c(columns_mean, columns_se, columns_max)
+```
+
+Start with "_means" variables. Presumably, the less overlap there is between distributions by diagnosis, the more predictive power the variable will have.
+
+```{r Boxplots, means}
+mean_list <- list()
+
+par(mfrow = c(2, 5), mar = c(2, 3, 3, 1), oma = c(0, 0, 2, 0))
+title_size = 0.1
+
+for (header in columns_mean) {
+  # Generate the boxplots for each diagnosis group
+  mean_list[[header]] <- boxplot(fna_cancer[[header]] ~ fna_cancer$diagnosis, 
+                                  main = header, 
+                                  xlab = "Diagnosis", 
+                                  ylab = header, 
+                                  cex.axis = .8, 
+                                  cex.lab = .8, 
+                                  cex.main = .8,)
+}
+```
+
+Using IQR overlap as a visual proxy for overall overlap, "fractal_dimension" appears to have no predictive power; "symmetry" and "smoothness" have some; and the rest have significantly more. Radius, perimeter, areas, and both concavity measures appear to have the most predictive potential.
+
+Next, boxplots of the "_se" variables,
+
+```{r Boxplots, standard errors}
+se_list <- list()
+
+par(mfrow = c(2, 5), mar = c(2, 3, 3, 1), oma = c(0, 0, 2, 0))
+title_size = 0.1
+
+for (header in columns_se) {
+  # Generate the boxplots for each diagnosis group
+  se_list[[header]] <- boxplot(fna_cancer[[header]] ~ fna_cancer$diagnosis, 
+                                  main = header, 
+                                  xlab = "Diagnosis", 
+                                  ylab = header, 
+                                  cex.axis = .8, 
+                                  cex.lab = .8, 
+                                  cex.main = .8,)
+}
+```
+
+The standard errors measures appear to have signficiantly more IQR overlap than than the mean measures. The same subset -- radius, area, perimeter and concavity -- appear to have the most value. Outliers appear to have a greater impact on this subset compared to mean and worst subsets.
+
+Finally, the "_worst" variables.
+
+```{r Boxplots, maxima}
+max_list <- list()
+
+par(mfrow = c(2, 5), mar = c(2, 3, 3, 1), oma = c(0, 0, 2, 0))
+title_size = 0.1
+
+for (header in columns_max) {
+  # Generate the boxplots for each diagnosis group
+  max_list[[header]] <- boxplot(fna_cancer[[header]] ~ fna_cancer$diagnosis, 
+                                  main = header, 
+                                  xlab = "Diagnosis", 
+                                  ylab = header, 
+                                  cex.axis = .8, 
+                                  cex.lab = .8, 
+                                  cex.main = .8,)
+}
+```
+
+Maximum values appear to have slightly less overlap overall than the mean measures. "Fractal_dimension_worst" has partial overlap, in contrast to the more total overlap of "fractal_dimension_mean". Again, radius, area, perimeter and concavity look like the most promising predictors of diagnosis.
+
+A correlation matrix can give us a quick visual of correlating and non-correlating variables.
+
+```{r fig.width=8, fig.height=8}
+cor_fna_cancer <- cor(select(fna_cancer, select = -diagnosis))
+heatmap(cor_fna_cancer, 
+        xlab = "Variables", 
+        ylab = "Variables",
+        main = "Correlation Matrix",
+        symm = TRUE,
+       # cexRow = .7,
+     #   cexCol = .6,
+        margins = c(8, 8),
+        labRow = names(cor_fna_cancer),
+        labCol = names(cor_fna_cancer))
+```
+
+There is a noticeable cluster of weakly-correlating variables in the upper right/lower left corners: perimeter, radius and area (mean and worst) appear to correlate weakly with a handful of se variables as well as fractal_dimension_mean, the boxplots of which have the most pronounced overlap.
+
+## Preprocessing
+
+```{r create train and test subsets}
+# Set the seed.
+set.seed(1842)
+
+# Set n to the number of observations in the data (use fna_scaled)
+n <- nrow(fna_scaled)
+
+# Set the index of the test set at 20%.
+test_index <- sample.int(n, size = round(0.2 * n))
+
+# Define the training set as the complement of test_idx
+train_fna <- fna_scaled[-test_index,]
+
+# Define the test set using test_idx
+test_fna <- fna_scaled[test_index,]
+
+# Glimpse of train set.
+cat("Training set has",nrow(train_fna),"rows\nTest set has", nrow(test_fna), "rows\n")
+```
+
+## Decision Tree
+
+Create a decision tree model for each variable to see whether any are strong predictor candidates by themselves:
+
+```{r}
+variable_names <- c()
+accuracies <- c()
+
+# loop through each column of train_fna, excluding the first column
+for (col in colnames(train_fna)[-1]) {
+  
+  # create formula for decision tree using col as the predictor
+  formula <- as.formula(paste0("diagnosis ~ ", col))
+  
+  # train decision tree on train_fna using formula
+  dt <- rpart(formula, data = train_fna)
+  
+  # evaluate accuracy of decision tree on test_fna
+  predicted <- predict(dt, newdata = test_fna, type = "class")
+  actual <- test_fna$diagnosis
+  accuracy <- sum(predicted == actual) / length(actual)
+  
+  # add variable name and accuracy to vectors
+  variable_names <- c(variable_names, col)
+  accuracies <- c(accuracies, accuracy)
+}
+
+# create data frame with variable names and accuracies
+results <- data.frame(variable = variable_names, accuracy = accuracies)
+
+# sort data frame by descending accuracy
+results <- results[order(-results$accuracy), ]
+
+# print sorted table of decision tree accuracies
+print(results)
+```
+
+"radius_worst" and "area_worst" are tied for 1st place with 94.7% accuracy, with "area_mean" tied for 2nd place with "perimeter_worst" at 92.1% (the exact same values with these pairs and others suggests they are highly correlated with each other; this would make sense given that measures like radius, perimeter and area are geometrically proportional). 
+
+Try some decision trees with fomulas that pair one of our 1st place predictors with one that doesn't appear to measure physical size (e.g., concavity, a measure of shape)
+
+```{r}
+dt_pair_01 <- rpart(diagnosis ~ radius_worst + concavity_worst, data = train_fna)
+test_fna$pred <- predict(dt_pair_01, newdata = test_fna, type = "class")
+confusion01 <- table(test_fna$diagnosis, test_fna$pred)
+confusion01
+cat("Accuracy: ", sum(diag(confusion01)) / sum(confusion01))
+```
+
+93% accuracy slightly underperforms our leading variables by themselves. Now try texture_worst instead of concativy_worst.
+
+```{r}
+dt_pair_02 <- rpart(diagnosis ~ radius_worst + texture_worst, data = train_fna)
+test_fna$pred <- predict(dt_pair_01, newdata = test_fna, type = "class")
+confusion02 <- table(test_fna$diagnosis, test_fna$pred)
+confusion02
+cat("Accuracy: ", sum(diag(confusion02)) / sum(confusion02))
+```
+
+In both cases, adding either concavity_worst or texture_worst to radius_worst, we get the exact same accuracy scores, down by almost 2% from radius_worst by itself. As 94.7% was a relatively strong result out of the gate, we continue to see if other models out-perform this benchmark.
+
+```{r Decision tree: radius_worst only}
+dt_rad_worst <- rpart(diagnosis ~ radius_worst, data = train_fna)
+test_fna$pred <- predict(dt_rad_worst, newdata = test_fna, type = "class")
+confusion_rw <- table(test_fna$diagnosis, test_fna$pred)
+confusion_rw
+cat("Accuracy: ", sum(diag(confusion_rw)) / sum(confusion_rw))
+```
+
+```{r}
+# diagram of final decision tree
+plot(as.party(dt_rad_worst))
+```
+
+## Random Forest
+
+In selecting features for our random forest formula, the standard rule of thumb is to take the square root of the number of features (in this case, 30^0.5, or 5, rounding to the nearest). Given how strongly correlated many of the available features seem to be to each other, we can add a few to the mix.
+
+```{r Random forest preliminaries}
+# Factorize 'diagnosis' in train and test sets
+train_fna$diagnosis <- factor(train_fna$diagnosis)
+test_fna$diagnosis <- factor(test_fna$diagnosis)
+
+# Define a formula
+fna_formula_rf <- as.formula(diagnosis ~ radius_worst + concavity_worst + texture_se + area_mean + perimeter_se + smoothness_mean + fractal_dimension_se + symmetry_mean)
+```
+
+Start with 100 trees, mtry = 5
+
+```{r}
+# Create bagged set of 100 trees
+fna_bagging_100_5 <- randomForest(fna_formula_rf,
+                               data = train_fna,
+                               mtry=5,
+                               ntree=100,
+                               na.action=na.roughfix)
+fna_bagging_100_5
+accuracy <- sum(diag(fna_bagging_100_5$confusion)) / sum(fna_bagging_100_5$confusion)
+cat("Accuracy:", accuracy)
+```
+
+Ramp up to 500 trees:
+
+```{r}
+# Create bagged set of 500 trees
+fna_bagging_500_5 <- randomForest(fna_formula_rf,
+                               data = train_fna,
+                               mtry=5,
+                               ntree=500,
+                               na.action=na.roughfix)
+fna_bagging_500_5
+cat("Accuracy:", sum(diag(fna_bagging_500_5$confusion)) / sum(fna_bagging_500_5$confusion))
+```
+
+Almost identitical accuracy score. Try a value in between, 200 trees:
+
+```{r}
+# Create bagged set of 200 trees, mtry = 5
+fna_bagging_200_5 <- randomForest(fna_formula_rf,
+                               data = train_fna,
+                               mtry=5,
+                               ntree=200,
+                               na.action=na.roughfix)
+fna_bagging_200_5
+cat("Accuracy:", sum(diag(fna_bagging_200_5$confusion)) / sum(fna_bagging_200_5$confusion))
+```
+
+This is noticeably better at 95.8% vs 95.1%. Settling on 200 trees, see what different mtry values give:
+
+```{r}
+# Create bagged set of 200 trees, lower mtry to 3
+fna_bagging_200_3 <- randomForest(fna_formula_rf,
+                               data = train_fna,
+                               mtry=3,
+                               ntree=200,
+                               na.action=na.roughfix)
+fna_bagging_200_3
+cat("Accuracy:", sum(diag(fna_bagging_200_3$confusion)) / sum(fna_bagging_200_3$confusion))
+```
+
+Decreasing mtry to 3 results in a small, possibly negligible performace hit. One more, 200 trees at mtry = 8:
+
+```{r}
+# Create bagged set of 200 trees, mtry = 1
+fna_bagging_200_8 <- randomForest(fna_formula_rf,
+                               data = train_fna,
+                               mtry=8,
+                               ntree=200,
+                               na.action=na.roughfix)
+fna_bagging_200_8
+cat("Accuracy:", sum(diag(fna_bagging_200_8$confusion)) / sum(fna_bagging_200_8$confusion))
+```
+
+94.9% is a much more substantial hit, so settle on 200 trees, mtry = 5.
+
+```{r Winner: 200 trees, mtry = 5}
+# The winner
+fna_bagging_200_5
+cat("Accuracy:", sum(diag(fna_bagging_200_5$confusion)) / sum(fna_bagging_200_5$confusion))
+```
+
+```{r}
+importance(fna_bagging_200_5)%>% 
+  as.data.frame() %>% 
+  rownames_to_column() %>%
+  arrange(desc(MeanDecreaseGini))
+```
+
+The Gini scores show the top 3 variables account for 87.0% of variance, the top 4 91.4%, and the top 5 94.8%.
+
+Put the test data through our 200-tree/mtry=5 model:
+
+```{r}
+# Try against the test set
+fna_pred_200_5 <- randomForest(fna_formula_rf,
+                               data = test_fna,
+                               mtry=5,
+                               ntree=200,
+                               na.action=na.roughfix)
+confusion_rf <- fna_pred_200_5$confusion
+confusion_rf
+cat("Accuracy:", sum(diag(confusion_rf)) / sum(confusion_rf))
+```
+
+## K-Nearest Neighbors
+
+Create subsets of the train and test sets using the same 8 variables from the random forest example:
+
+```{r Train subset}
+# Subset of training data
+train_fna_knn <- train_fna[, c("diagnosis", "radius_worst", "concavity_worst", "texture_se", "area_mean", "perimeter_se", "smoothness_mean", "fractal_dimension_se", "symmetry_mean")]
+
+glimpse(train_fna_knn)
+```
+
+```{r Test subset}
+# Subset of testing data
+test_fna_knn <- test_fna[, c("diagnosis", "radius_worst", "concavity_worst", "texture_se", "area_mean", "perimeter_se", "smoothness_mean", "fractal_dimension_se", "symmetry_mean")]
+
+glimpse(test_fna_knn)
+```
+
+Plot the train and test error rates to spot most promising k-values:
+
+```{r}
+# Define the range of K values
+k_values <- 1:20
+
+# Initialize an empty vector to store the error rates
+train_error_rates <- numeric(length(k_values))
+test_error_rates <- numeric(length(k_values))
+
+# Perform k-nearest neighbors classification for each K value
+for (i in k_values) {
+  train_predictions <- knn(train = train_fna_knn[, 2:9], test = train_fna_knn[, 2:9], cl = train_fna_knn$diagnosis, k = i)
+  train_error_rates[i] <- mean(train_predictions != train_fna_knn$diagnosis)
+  
+  test_predictions <- knn(train = train_fna_knn[, 2:9], test = test_fna_knn[, 2:9], cl = train_fna_knn$diagnosis, k = i)
+  test_error_rates[i] <- mean(test_predictions != test_fna_knn$diagnosis)
+}
+
+# Create a data frame with K, train error rates, and test error rates
+error_df <- data.frame(K = k_values, TrainErrorRate = train_error_rates, TestErrorRate = test_error_rates)
+
+# Convert the data frame from wide to long format
+error_df_long <- tidyr::gather(error_df, "Dataset", "ErrorRate", -K)
+
+# Plot the error rates against K
+ggplot(data = error_df_long, aes(x = K, y = ErrorRate, color = Dataset)) +
+  geom_line() +
+  geom_point() +
+  labs(x = "K", y = "Error Rate", color = "Dataset")
+```
+
+```{r}
+set.seed(1842)
+```
+
+k = 16 jumps out with the narrowest gap! We'll try 16, as as well as nearby values of k = 13 and k = 18:
+
+```{r}
+# k = 16
+fna_knn_pred_16 <- knn(train = train_fna_knn[,2:9], test = test_fna_knn[,2:9], cl = train_fna_knn$diagnosis, k = 16)
+
+# Create the confusion matrix.
+knn_conf_16 <- table(fna_knn_pred_16, test_fna_knn$diagnosis)
+knn_conf_16
+cat("Accuracy: ", sum(diag(knn_conf_16)) / sum(knn_conf_16))
+```
+
+```{r}
+# k = 18
+fna_knn_pred_18 <- knn(train = train_fna_knn[,2:9], test = test_fna_knn[,2:9], cl = train_fna_knn$diagnosis, k = 18)
+
+# Create the confusion matrix.
+knn_conf_18 <- table(fna_knn_pred_18, test_fna_knn$diagnosis)
+knn_conf_18
+cat("Accuracy: ", sum(diag(knn_conf_18)) / sum(knn_conf_18))
+```
+
+```{r}
+# k = 13
+fna_knn_pred_13 <- knn(train = train_fna_knn[,2:9], test = test_fna_knn[,2:9], cl = train_fna_knn$diagnosis, k = 13)
+
+# Create the confusion matrix.
+knn_conf_13 <- table(fna_knn_pred_13, test_fna_knn$diagnosis)
+knn_conf_13
+cat("Accuracy: ", sum(diag(knn_conf_13)) / sum(knn_conf_13))
+```
+
+All values of k give the same accuracy of 93.9%, complete with identical confusion matrices. Choose k = 16 given the original errors plot.
+
+## Wrap-up
+
+```{r Metrics for candidate models}
+# Calculate performance metrics for confusion_rw
+accuracy_rw <- sum(diag(confusion_rw)) / sum(confusion_rw)
+precision_rw <- confusion_rw[2, 2] / sum(confusion_rw[, 2])
+recall_rw <- confusion_rw[2, 2] / sum(confusion_rw[2, ])
+specificity_rw <- confusion_rw[1, 1] / sum(confusion_rw[1, ])
+f1_score_rw <- 2 * (precision_rw * recall_rw) / (precision_rw + recall_rw)
+
+# Calculate performance metrics for confusion_rf
+accuracy_rf <- sum(diag(confusion_rf)) / sum(confusion_rf)
+precision_rf <- confusion_rf[2, 2] / sum(confusion_rf[, 2])
+recall_rf <- confusion_rf[2, 2] / sum(confusion_rf[2, ])
+specificity_rf <- confusion_rf[1, 1] / sum(confusion_rf[1, ])
+f1_score_rf <- 2 * (precision_rf * recall_rf) / (precision_rf + recall_rf)
+
+# Calculate performance metrics for knn_conf_16
+accuracy_knn <- sum(diag(knn_conf_16)) / sum(knn_conf_16)
+precision_knn <- knn_conf_16[2, 2] / sum(knn_conf_16[, 2])
+recall_knn <- knn_conf_16[2, 2] / sum(knn_conf_16[2, ])
+specificity_knn <- knn_conf_16[1, 1] / sum(knn_conf_16[1, ])
+f1_score_knn <- 2 * (precision_knn * recall_knn) / (precision_knn + recall_knn)
+
+# Create the table
+metrics_table <- data.frame(Metric = c("Accuracy", "Precision", "Recall", "Specificity", "F1 Score"),
+                            confusion_rw = c(accuracy_rw, precision_rw, recall_rw, specificity_rw, f1_score_rw),
+                            confusion_rf = c(accuracy_rf, precision_rf, recall_rf, specificity_rf, f1_score_rf),
+                            knn_conf_16 = c(accuracy_knn, precision_knn, recall_knn, specificity_knn, f1_score_knn))
+
+# Print the table
+print(metrics_table)
+```
+
+All models have comparable accuracy and F1 scores, within a 1% range. K-nearest neighbors notably under-performs the others on precision (positive predicitive value, i.e., true positives out of predicted positives), and specificity (true negative rate) but outperforms them on recall (true positive rate).
+
+Recomendation: the K-nearest neighbors model appears to be the best performer under the circumstances. Given the nature of the diagnosis, it seems desirable to minimize false negatives (i.e., via high recall), to help ensure that malignant tumors are identified more reliably and treated as early as possible. Sacrificing a lower false positive rate seems to be a reasonable trade-off, given that a patient is more likely to seek a second opinion for a false positive than for a false negative.
